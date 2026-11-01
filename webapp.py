@@ -686,7 +686,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <meta name="color-scheme" content="dark"/>
-<title>3·4·5D downloader</title>
+<title>5D downloader</title>
 <style>
 :root{--bg:#000;--sf:#0b0b10;--lo:rgba(0,0,0,.95);--hi:rgba(255,255,255,.055);--ac:#7c5cff;--ac2:#00e5ff;--hot:#ff3d9a;--tx:#eceeff;--mu:#6b6d92;--e:cubic-bezier(.16,1,.3,1);
 --out:8px 8px 20px var(--lo),-6px -6px 16px var(--hi);--in:inset 6px 6px 14px var(--lo),inset -5px -5px 12px var(--hi)}
@@ -755,7 +755,7 @@ pre{font:11px/1.65 ui-monospace,monospace;color:#8fe;white-space:pre-wrap;margin
 @media(prefers-reduced-motion:reduce){*{animation:none!important}}
 </style></head><body>
 <canvas id="c"></canvas><div id="bglog" aria-hidden="true"></div>
-<div class="bar"><div class="mark grad">3·4·5D</div><div class="sp"></div>
+<div class="bar"><div class="mark grad">5D</div><div class="sp"></div>
  <button class="ib" id="bV" aria-label="vault">⌂</button><button class="ib" id="bC" aria-label="cookies">◍</button><button class="ib" id="bL" aria-label="log">≡</button><button class="ib" id="bS" aria-label="sound">♪</button></div>
 
 <section class="step on" id="s-paste"><div class="big" data-big>PASTE</div>
