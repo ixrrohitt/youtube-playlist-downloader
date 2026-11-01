@@ -21,7 +21,7 @@ import traceback
 import uuid
 import zipfile
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 
 def _auto_install(pkgs: list[str]) -> None:
@@ -186,6 +186,15 @@ class YtdlpJobLogger:
 
 def _friendly_error(error: Exception) -> str:
     msg = str(error)
+    low = msg.lower()
+    if any(k in low for k in ("login required", "rate-limit reached", "need to log in", "log in to",
+                              "requested content is not available", "nsfw", "restricted video")):
+        return ("This site wants a logged-in session. Export cookies.txt from your browser while "
+                "logged in (Cookies button), upload it and retry.")
+    if "unsupported url" in low:
+        return "This link isn't supported (or it's a profile/page, not a post). Paste a direct post/video link."
+    if "no video could be found" in low or "there is no video" in low:
+        return "No video in this post (image-only?). Photos are tried automatically; if it still fails, upload cookies.txt."
     missing = []
     if not _HAS_EJS:
         missing.append("pip install -U yt-dlp-ejs")
@@ -246,9 +255,253 @@ def _entry(info: dict, url: str = "") -> dict:
     est = False
     if not sizes and dur:  # flat playlist entries: no formats, estimate from duration
         sizes, est = {str(h): int(dur * bps) for h, bps in _EST_BPS.items()}, True
+    aud = [f for f in (info.get("formats") or []) if f.get("vcodec") in (None, "none")
+           and f.get("acodec") not in (None, "none") and f.get("abr")]
+    ba = max(aud, key=lambda f: f["abr"], default=None)
     return {"title": info.get("title") or url or "(untitled)", "url": info.get("webpage_url") or url,
             "duration": dur, "thumbnail": th, "sizes": sizes, "est": est,
-            "audio": int(dur * 24000) if dur else None}  # mp3 192 kbps ~ 24 KB/s
+            "abr": int(ba["abr"]) if ba else None,
+            "acodec": (ba.get("acodec") or "").split(".")[0] if ba else None,
+            "audio": int(dur * 40000) if dur else None}  # mp3 320 kbps = 40 KB/s
+
+
+_SPOTIFY_RE = re.compile(r"open\.spotify\.com/(?:intl-[\w-]+/)?(track|album|playlist)/([A-Za-z0-9]+)")
+
+
+def _spotify_ref(url: str):
+    m = _SPOTIFY_RE.search(url or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _dig(obj, *keys):
+    for k in keys:
+        if not isinstance(obj, dict):
+            return {}
+        obj = obj.get(k) or {}
+    return obj
+
+
+SPOTIFY_AUTH: dict = {}
+_SP_SCOPE = "playlist-read-private playlist-read-collaborative"
+
+
+def _spotify_redirect() -> str:
+    env = os.environ.get("SPOTIFY_REDIRECT_URI", "").strip()
+    if env:
+        return env
+    port = int(os.environ.get("PORT") or 8000)
+    dom, name = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN"), os.environ.get("CODESPACE_NAME")
+    if dom and name:
+        return f"https://{name}-{port}.{dom}/api/spotify/callback"
+    return f"http://127.0.0.1:{port}/api/spotify/callback"
+
+
+def _spotify_token_request(form: dict) -> None:
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request("https://accounts.spotify.com/api/token", data=urlencode(form).encode(),
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            js = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(e.read().decode("utf-8", "ignore")[:200])
+    SPOTIFY_AUTH["access"] = js["access_token"]
+    SPOTIFY_AUTH["exp"] = time.time() + int(js.get("expires_in", 3600)) - 30
+    if js.get("refresh_token"):
+        SPOTIFY_AUTH["refresh"] = js["refresh_token"]
+    try:
+        (COOKIES_DIR / "spotify_token.json").write_text(json.dumps({"refresh": SPOTIFY_AUTH.get("refresh", "")}))
+    except OSError:
+        pass
+
+
+def _spotify_token() -> str | None:
+    cid = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+    if not cid:
+        return None
+    if not SPOTIFY_AUTH.get("refresh"):
+        try:
+            SPOTIFY_AUTH["refresh"] = json.loads((COOKIES_DIR / "spotify_token.json").read_text()).get("refresh", "")
+        except Exception:
+            pass
+    if SPOTIFY_AUTH.get("access") and SPOTIFY_AUTH.get("exp", 0) > time.time():
+        return SPOTIFY_AUTH["access"]
+    if SPOTIFY_AUTH.get("refresh"):
+        try:
+            _spotify_token_request({"grant_type": "refresh_token", "refresh_token": SPOTIFY_AUTH["refresh"],
+                                    "client_id": cid})
+            return SPOTIFY_AUTH["access"]
+        except Exception:
+            return None
+    return None
+
+
+def _spotapi_rows(sid: str, job_id: str | None) -> list | None:
+    """Optional, no login/Premium: full playlist via the `spotapi` package (Spotify web-player route).
+    Unofficial, so it can break whenever Spotify changes things. None on any problem."""
+    def log(m, lv="warn"):
+        if job_id:
+            _job_log(job_id, m, lv)
+    try:
+        from spotapi import PublicPlaylist  # type: ignore
+    except Exception as ex:
+        log(f"For full playlists without Premium: pip install spotapi pymongo redis  ({type(ex).__name__})")
+        return None
+    try:
+        log("Reading the full list via the web-player route (spotapi)…", "info")
+        rows = []
+        for chunk in PublicPlaylist(sid).paginate_playlist():
+            for it in (chunk or {}).get("items") or []:
+                d = ((it or {}).get("itemV2") or {}).get("data") or {}
+                if not d.get("name") or d.get("__typename") not in (None, "Track"):
+                    continue
+                arts = ", ".join(((a or {}).get("profile") or {}).get("name", "")
+                                 for a in ((d.get("artists") or {}).get("items") or []))
+                rows.append({"title": d["name"], "subtitle": arts,
+                             "duration": (d.get("trackDuration") or {}).get("totalMilliseconds") or 0})
+        return rows or None
+    except Exception as ex:
+        log(f"spotapi failed: {type(ex).__name__}: {str(ex)[:140]}")
+        return None
+
+
+def _spotify_api_rows(kind: str, sid: str, job_id: str | None) -> list | None:
+    """Full track list through the official Spotify Web API (needs a one-time login). None on any problem."""
+    import urllib.error
+    import urllib.request
+
+    def log(m, lv="warn"):
+        if job_id:
+            _job_log(job_id, m, lv)
+
+    tok = _spotify_token()
+    if not tok:
+        if os.environ.get("SPOTIFY_CLIENT_ID", "").strip():
+            log("Not logged in to Spotify yet: open /api/spotify/login in this app's address once, then retry.")
+        else:
+            log("Official Spotify API login is not set up (it needs a Premium developer app).")
+        return None
+    base = (f"https://api.spotify.com/v1/playlists/{sid}/items?limit=100" if kind == "playlist"
+            else f"https://api.spotify.com/v1/albums/{sid}/tracks?limit=50")
+    url, rows, retries, tried_old = base, [], 0, False
+    log("Reading the full list through the Spotify API…", "info")
+    while url:
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                js = json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and retries < 5:
+                retries += 1
+                time.sleep(min(int(e.headers.get("Retry-After") or 2), 10))
+                continue
+            if e.code in (400, 404) and kind == "playlist" and not rows and not tried_old:
+                tried_old, url = True, base.replace("/items?", "/tracks?")
+                continue
+            log(f"Spotify API {e.code}: {e.read().decode('utf-8', 'ignore')[:160]}")
+            return None
+        except Exception as ex:
+            log(f"Spotify API failed: {str(ex)[:120]}")
+            return None
+        for it in js.get("items") or []:
+            tr = (it.get("item") or it.get("track")) if kind == "playlist" else it
+            if not tr or tr.get("type") not in (None, "track") or not tr.get("name"):
+                continue
+            rows.append({"title": tr["name"],
+                         "subtitle": ", ".join(a.get("name", "") for a in (tr.get("artists") or [])),
+                         "duration": tr.get("duration_ms") or 0})
+        url = js.get("next")
+    return rows
+
+
+def _spotify_probe(url: str, job_id: str | None = None, limit: int = 200) -> dict:
+    # Spotify streams are DRM-protected, so we read track names from the public embed page
+    # and download each song's audio from YouTube (search "Artist - Title").
+    import urllib.request
+    kind, sid = _spotify_ref(url)
+    if job_id:
+        _job_log(job_id, f"Spotify {kind} detected: reading track list…")
+    req = urllib.request.Request(
+        f"https://open.spotify.com/embed/{kind}/{sid}",
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                 "Accept-Language": "en-US,en;q=0.9"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        html = r.read().decode("utf-8", "ignore")
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+    if not m:
+        raise ValueError("Could not read this Spotify link (private, or Spotify changed its page format).")
+    ent = _dig(json.loads(m.group(1)), "props", "pageProps", "state", "data", "entity")
+    cover = ""
+    srcs = (ent.get("coverArt") or {}).get("sources") or (ent.get("visualIdentity") or {}).get("image") or []
+    if srcs:
+        cover = srcs[-1].get("url") or ""
+    rows = ent.get("trackList") or []
+    capped = kind != "track" and len(rows) >= 100
+    if capped:
+        more = _spotapi_rows(sid, job_id) if kind == "playlist" else None
+        if not more or len(more) <= len(rows):
+            more = _spotify_api_rows(kind, sid, job_id) if _spotify_token() else more
+        if more and len(more) > len(rows):
+            rows, capped = more, False
+            if job_id:
+                _job_log(job_id, f"Full list received: {len(rows)} tracks.", "ok")
+    if not rows and kind == "track":
+        rows = [{"title": ent.get("title") or ent.get("name"),
+                 "subtitle": ", ".join(a.get("name", "") for a in (ent.get("artists") or [])),
+                 "duration": ent.get("duration")}]
+    videos = []
+    for t in rows[:max(limit, 1000)]:
+        title = (t.get("title") or "").strip()
+        artist = (t.get("subtitle") or "").replace("\xa0", " ").strip()
+        if not title:
+            continue
+        dur = (t.get("duration") or 0) / 1000 or None
+        q = f"{artist} - {title}".strip(" -")
+        videos.append({"title": q, "url": f"ytsearch1:{q} audio", "duration": dur, "thumbnail": cover or None,
+                       "sizes": {}, "est": False, "audio": int(dur * 40000) if dur else None})
+    if not videos:
+        raise ValueError("No tracks found in this Spotify link.")
+    if capped and job_id:
+        _job_log(job_id, "Only the first ~100 tracks could be read. Split the playlist into parts of <=100 "
+                         "songs and paste all the links together.", "warn")
+    if job_id:
+        _job_log(job_id, f"Found {len(videos)} track(s).", "ok")
+    return {"title": ent.get("name") or ent.get("title") or f"Spotify {kind}", "is_playlist": len(videos) > 1,
+            "mode": "single" if len(videos) == 1 else "multiple", "urls": [v["url"] for v in videos],
+            "videos": videos, "resolutions": _DEF_RES}
+
+
+def _spotify_many(urls: list, cookies_file: str | None, job_id: str) -> dict:
+    """Several links, at least one Spotify: expand Spotify links into tracks, read the rest normally."""
+    videos, seen = [], set()
+    titles = []
+    others = [u for u in urls if not _spotify_ref(u)]
+    for u in urls:
+        if not _spotify_ref(u):
+            continue
+        try:
+            info = _spotify_probe(u, job_id)
+        except Exception as ex:
+            _job_log(job_id, f"Could not read {u[:60]}: {str(ex)[:80]}", "warn")
+            continue
+        titles.append(info["title"])
+        for v in info["videos"]:
+            if v["url"] not in seen:
+                seen.add(v["url"])
+                videos.append(v)
+    if others:
+        for v in _probe_many(others, cookies_file, job_id)["videos"]:
+            if v["url"] not in seen:
+                seen.add(v["url"])
+                videos.append(v)
+    if not videos:
+        raise ValueError("Nothing could be read from these links.")
+    title = titles[0] if len(titles) == 1 and not others else f"{len(videos)} items"
+    res = sorted({int(h) for v in videos for h in v["sizes"]}) or _DEF_RES
+    return {"title": title, "is_playlist": len(videos) > 1, "mode": "single" if len(videos) == 1 else "multiple",
+            "urls": [v["url"] for v in videos], "videos": videos, "resolutions": res}
 
 
 def probe_url(url: str, cookies_file: str | None, limit: int = 200, job_id: str | None = None) -> dict:
@@ -321,14 +574,17 @@ def run_probe(job_id: str) -> None:
             raise ValueError("Please paste at least one YouTube URL.")
         _job_log(job_id, f"Cookies: {'loaded' if cookies_file else 'not uploaded'}.")
         _job_update(job_id, progress=25, stage="Detecting mode")
-        if len(urls) > 1:
+        if any(_spotify_ref(u) for u in urls):
+            _job_update(job_id, progress=40, stage="Reading Spotify")
+            info = _spotify_many(urls, cookies_file, job_id)
+        elif len(urls) > 1:
             _job_log(job_id, f"Multiple mode: reading {len(urls)} links in parallel…")
             info = _probe_many(urls, cookies_file, job_id)
         else:
             playlist = _is_playlist_url(urls[0])
             _job_update(job_id, progress=40, stage="Reading playlist" if playlist else "Reading video")
             info = probe_url(urls[0], cookies_file, job_id=job_id)
-            info["mode"] = "playlist" if playlist else "single"
+            info["mode"] = "playlist" if (playlist or info.get("is_playlist")) else "single"
             info["urls"] = urls
         _job_update(job_id, status="probe_done", stage="Ready", progress=100, probe=info)
         _job_log(job_id, "Fetch complete.", "ok")
@@ -359,6 +615,10 @@ def _make_progress_hook(job_id: str):
             elif fin:
                 j["current_pct"] = 0
         if fin:
+            ai = d.get("info_dict") or {}
+            if ai.get("abr") and ai.get("vcodec") in (None, "none"):
+                _job_log(job_id, f"Source audio: {(ai.get('acodec') or '?').split('.')[0]} "
+                                 f"~{int(ai['abr'])} kbps. Converting to MP3 320k.", "ok")
             _job_log(job_id, "File finished. Merging/converting if needed…", "ok")
     return hook
 
@@ -408,6 +668,32 @@ def _fix_unmerged(out_dir: Path, job_id: str) -> None:
             _job_log(job_id, f"Could not merge '{base}'; leaving the separate streams.", "error")
 
 
+def _gallery_dl_fallback(job_id: str, url: str, out_dir: Path, cookies: str) -> None:
+    # yt-dlp only does video/audio. For photo posts (Instagram/X images) try gallery-dl.
+    import subprocess
+    try:
+        import gallery_dl  # type: ignore  # noqa: F401
+    except ImportError:
+        try:
+            _auto_install(["gallery-dl"])
+        except SystemExit:
+            _job_log(job_id, "Could not install gallery-dl (needed for image posts).", "warn")
+            return
+    _job_update(job_id, stage="Fetching images")
+    _job_log(job_id, "No video found; trying image download (gallery-dl)…", "warn")
+    cmd = [sys.executable, "-m", "gallery_dl", "-D", str(out_dir)]
+    if cookies:
+        cmd += ["--cookies", cookies]
+    cmd.append(url)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
+        for ln in tail:
+            _job_log(job_id, ln, "ok" if r.returncode == 0 else "warn")
+    except Exception as ex:
+        _job_log(job_id, f"gallery-dl failed: {ex}", "error")
+
+
 def run_download(job_id: str) -> None:
     with JOBS_LOCK:
         job = JOBS[job_id]
@@ -442,8 +728,9 @@ def run_download(job_id: str) -> None:
         else:
             _job_log(job_id, "ffmpeg missing: video and audio CANNOT be merged!", "error")
         if media == "audio":
+            opts["format_sort"] = ["abr", "asr"]  # highest bitrate stream first
             opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
-                                       "preferredquality": "192"}]
+                                       "preferredquality": "320"}]
         else:
             opts["merge_output_format"] = "mp4"
 
@@ -477,10 +764,21 @@ def run_download(job_id: str) -> None:
             if JOBS[job_id].get("cancel"):
                 raise _Cancel("Cancelled by user")
 
+        if media == "video" and not any(p.is_file() and not p.name.endswith((".part", ".ytdl"))
+                                        for p in out_dir.rglob("*")):
+            for t in targets:
+                if not t.startswith("ytsearch"):
+                    _gallery_dl_fallback(job_id, t, out_dir, cookies)
+
         _fix_unmerged(out_dir, job_id)
         _job_update(job_id, stage="Collecting files")
         files = sorted(os.path.join(r, f) for r, _, fs in os.walk(out_dir) for f in fs
                        if not f.endswith((".part", ".ytdl")))
+        if not files:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            raise RuntimeError("Nothing could be downloaded. Check the log; Instagram/X often need "
+                               "a cookies.txt from a logged-in browser, and yt-dlp may need an update "
+                               "(pip install -U yt-dlp).")
         links: list[dict] = []
         if mode == "single" or len(files) <= 1:
             for fp in files:
@@ -575,10 +873,54 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._send_json(200, out)
         elif path == "/api/files":
             self._send_json(200, {"files": _list_downloaded_files()})
+        elif path.startswith("/api/spotify/"):
+            self._spotify_route(path)
         elif path.startswith("/downloads/") and not path.endswith("/"):
             super().do_GET()
         else:
             self.send_error(404)
+
+    def _spotify_route(self, path: str) -> None:
+        import base64
+        import hashlib
+        import secrets
+        q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+        cid = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+
+        def page(msg: str, code: int = 200) -> None:
+            body = ("<!doctype html><meta charset=utf-8><body style='background:#000;color:#eceeff;"
+                    "font:18px system-ui;padding:12vh 8vw'>" + msg.replace("<", "&lt;") + "</body>").encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        if not cid:
+            return page("Set the SPOTIFY_CLIENT_ID environment variable first, then restart the app.", 400)
+        if path.endswith("/login"):
+            ver, st = secrets.token_urlsafe(64), secrets.token_urlsafe(16)
+            SPOTIFY_AUTH.update(verifier=ver, state=st)
+            ch = base64.urlsafe_b64encode(hashlib.sha256(ver.encode()).digest()).rstrip(b"=").decode()
+            loc = "https://accounts.spotify.com/authorize?" + urlencode({
+                "client_id": cid, "response_type": "code", "redirect_uri": _spotify_redirect(),
+                "scope": _SP_SCOPE, "state": st, "code_challenge_method": "S256", "code_challenge": ch})
+            self.send_response(302)
+            self.send_header("Location", loc)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path.endswith("/callback"):
+            if q.get("error") or not q.get("code") or q.get("state") != SPOTIFY_AUTH.get("state"):
+                return page("Spotify login was cancelled or the state did not match. Open /api/spotify/login again.", 400)
+            try:
+                _spotify_token_request({"grant_type": "authorization_code", "code": q["code"],
+                                        "redirect_uri": _spotify_redirect(), "client_id": cid,
+                                        "code_verifier": SPOTIFY_AUTH.get("verifier", "")})
+            except Exception as ex:
+                return page(f"Login failed: {ex}", 400)
+            return page("Spotify connected. You can close this tab and fetch your playlist again.")
+        self.send_error(404)
 
     def do_DELETE(self):
         if urlparse(self.path).path != "/api/files":
@@ -882,7 +1224,7 @@ function showProbe(j){$("#cT").textContent=j.title;
  $("#cards").innerHTML=j.videos.map((v,i)=>`<div class="cd sel ${i<12?"a":""}" style="--i:${i}">${v.thumbnail?`<img loading="lazy" decoding="async" src="${esc(v.thumbnail)}" onerror="this.outerHTML='<div class=th></div>'">`:'<div class="th"></div>'}<b>${esc(v.title)}</b></div>`).join("");
  $$("#cards .cd").forEach(c=>c.onclick=()=>{c.classList.toggle("sel");selTxt();tone(c.classList.contains("sel")?740:420,.2)});selTxt();
  const rs=(j.resolutions||[]).filter(r=>r<=4320).sort((a,b)=>a-b);S.res=rs.includes(720)?720:0;
- $("#chips").innerHTML=[0,...rs].map(r=>`<span class="ch ${r===S.res?"on":""}" data-r="${r}"><b>${r?r+"p":"Best"}</b><small>—</small></span>`).join("");setMedia("video");go("choose")}
+ $("#chips").innerHTML=[0,...rs].map(r=>`<span class="ch ${r===S.res?"on":""}" data-r="${r}"><b>${r?r+"p":"Best"}</b><small>—</small></span>`).join("");setMedia(j.videos.length&&j.videos.every(v=>/^ytsearch/.test(v.url))?"audio":"video");go("choose")}
 $("#chips").onclick=e=>{const c=e.target.closest("[data-r]");if(!c)return;S.res=+c.dataset.r;$$("#chips .ch").forEach(x=>x.classList.toggle("on",x===c));updateSizes();tone(600,.2)};
 function fail(msg,back){logOff();S.busy=false;try{localStorage.removeItem("ytdl_job")}catch(_){}$("#fErr").textContent=msg;toast(msg.slice(0,60));phase("error");go(back);setTimeout(()=>phase("idle"),50)}
 function phaseOf(j,cur){const s=j.stage||"";if(j.status==="done")return"done";if(j.status==="error")return"error";if(/Merg/i.test(s))return"merge";if(/Extract|Convert|Audio/i.test(s))return"convert";if(/ZIP/i.test(s))return"zip";if(j.status==="fetching")return"fetch";if(/^Downloading/i.test(s))return"download";return cur}
@@ -926,11 +1268,12 @@ async function refreshLib(){try{const f=(await api("/api/files")).files||[];$("#
 const fb=b=>!b?"—":b>=1073741824?(b/1073741824).toFixed(2)+" GB":b>=1048576?(b/1048576).toFixed(b>=1e8?0:1)+" MB":Math.max(1,b/1024|0)+" KB";
 function vSize(v,res){const s=v.sizes||{},hs=Object.keys(s).map(Number).sort((a,b)=>a-b);if(!hs.length)return null;const k=!res?hs[hs.length-1]:(hs.filter(x=>x<=res).pop()||hs[0]);return s[k]||null}
 function total(res,media){let sum=0,unk=0,est=false;for(const i of selIdx()){const v=S.probe.videos[i],z=media==="audio"?v.audio:vSize(v,res);if(z){sum+=z;if(v.est||media==="audio")est=true}else unk++}return{sum,unk,est}}
+function aq(){let b=0,c="";for(const i of selIdx()){const v=S.probe.videos[i];if(v.abr&&v.abr>b){b=v.abr;c=v.acodec||""}}return b?"source "+c+" ~"+b+" kbps":"best source available"}
 function updateSizes(){if(!S.probe)return;const n=selIdx().length;
  $$("#chips .ch").forEach(c=>{const t=total(+c.dataset.r,"video");c.querySelector("small").textContent=t.sum?(t.est?"~":"")+fb(t.sum):"—"});
  const tv=total(S.res,"video"),ta=total(0,"audio"),t=S.media==="audio"?ta:tv;
- $("#tV").textContent="MP4 · "+(tv.sum?(tv.est?"~":"")+fb(tv.sum):"size n/a");$("#tA").textContent="MP3 · "+(ta.sum?"~"+fb(ta.sum):"size n/a");
- $("#usage").innerHTML=n?`<b class="grad">${t.sum?(t.est?"≈ ":"")+fb(t.sum):"size unknown"}</b>of data<span> · ${n} ${n>1?"files":"file"} · ${S.media==="video"?(S.res?S.res+"p":"best quality"):"192 kbps"}${t.unk?" · "+t.unk+" unknown":""}</span>`:"nothing selected";
+ $("#tV").textContent="MP4 · "+(tv.sum?(tv.est?"~":"")+fb(tv.sum):"size n/a");$("#tA").textContent="MP3 320k · "+(ta.sum?"~"+fb(ta.sum):"size n/a");
+ $("#usage").innerHTML=n?`<b class="grad">${t.sum?(t.est?"≈ ":"")+fb(t.sum):"size unknown"}</b>of data<span> · ${n} ${n>1?"files":"file"} · ${S.media==="video"?(S.res?S.res+"p":"best quality"):"MP3 320 kbps · "+aq()}${t.unk?" · "+t.unk+" unknown":""}</span>`:"nothing selected";
  $("#lsz").textContent=n&&t.sum?(t.est?"≈ ":"")+fb(t.sum)+" · "+(S.media==="video"?"video":"audio"):n?"size unknown":"pick something"}
 /* ===== ambient log: low-opacity background, fades away when the process ends ===== */
 const bg=$("#bglog");let bgLast="",bgOff=0;
@@ -964,6 +1307,9 @@ def main():
         print(f"\n  🌐 Open in browser:  https://{cs_name}-{port}.{cs_domain}\n")
     else:
         print(f"\n  🌐 Open in browser:  http://{host}\n")
+    if os.environ.get("SPOTIFY_CLIENT_ID", "").strip():
+        print(f"  🎵 Spotify: add this Redirect URI in your Spotify app:  {_spotify_redirect()}")
+        print("     then open  /api/spotify/login  once (same address as above) to unlock full playlists.\n")
     print("  (Ctrl+C to stop)\n")
     try:
         server.serve_forever()
