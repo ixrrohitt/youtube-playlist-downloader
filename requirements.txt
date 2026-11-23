@@ -3,7 +3,8 @@ yt-dlp-ejs>=0.1.0
 rich>=13.0.0
 imageio-ffmpeg
 gallery-dl
-spotdl
 spotapi 
 pymongo 
 redis
+flask>=3.0
+requests>=2.31
