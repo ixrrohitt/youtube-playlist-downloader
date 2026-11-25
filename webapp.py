@@ -610,6 +610,78 @@ def run_probe(job_id: str) -> None:
         _job_log(job_id, m, "error")
 
 
+# ---------------- live view of a job's files (feeds the panel in the browser) ----------------
+_SPLIT_RE = re.compile(r"\.f[\w-]+\.\w+(\.part)?$")
+
+
+def _row_base(path: str) -> str:
+    """'/x/Title.f137.mp4.part' / 'Title.mp3' -> 'Title' (one row per video, however many streams)."""
+    n = os.path.basename(path or "")
+    n = re.sub(r"\.part$", "", n)
+    m = re.match(r"(.+)\.f[\w-]+\.\w+$", n)
+    return m.group(1) if m else os.path.splitext(n)[0]
+
+
+def _frow_update(j: dict, d: dict, key: str, act: dict) -> None:
+    """Called with JOBS_LOCK held from yt-dlp's progress hook: rows for the standard (non-turbo) downloader."""
+    base = _row_base(key)
+    if not base:
+        return
+    r = j.setdefault("_frows", {}).setdefault(
+        base, {"state": "run", "frac": 0.0, "sp": 0.0, "streams": set(), "fin": 0})
+    split = bool(_SPLIT_RE.search(key or ""))
+    cur, sp = act.get(key) or (0.0, 0.0)
+    if d.get("status") == "downloading":
+        r["state"] = "run"
+        r["streams"].add(key)
+        r["frac"] = ((min(len(r["streams"]), 2) - 1) + cur) / 2 if split else cur
+        r["sp"] = sp
+    elif d.get("status") == "finished":
+        r["sp"] = 0.0
+        r["fin"] += 1
+        if split and r["fin"] < 2:
+            r["frac"] = 0.5
+        else:
+            r["state"], r["frac"] = "process", 1.0
+
+
+def _cells(T, maxc: int = 60):
+    """Per-piece progress of one video (all its streams) squeezed into <= maxc cells: ([percent], [active idx])."""
+    segs = []
+    for it, _f in T.items:
+        for i in range(it.n):
+            ln = min(it.size, (i + 1) * it.piece) - i * it.piece
+            segs.append((ln if it.pst[i] == 2 else it.pgot[i], ln, it.pst[i] == 1))
+    if not segs:
+        return [], []
+    g = -(-len(segs) // maxc)
+    cells, act = [], []
+    for c in range(0, len(segs), g):
+        grp = segs[c:c + g]
+        tot = sum(x[1] for x in grp)
+        cells.append(int(100 * sum(x[0] for x in grp) / tot) if tot else 0)
+        if any(x[2] for x in grp):
+            act.append(len(cells) - 1)
+    return cells, act
+
+
+def _items_view(j: dict) -> list:
+    rows = [(T.order, T.view()) for T in list(j.get("_tt") or []) if T.state != "std"]
+    for p in list((j.get("_pend") or {}).values()):
+        rows.append((p["order"], {"key": p["key"], "name": p["name"], "state": "resolve", "engine": "turbo"}))
+    rows.sort(key=lambda x: x[0])
+    out = [r for _, r in rows]
+    for base, r in list((j.get("_frows") or {}).items()):
+        out.append({"key": "s:" + base, "name": base, "state": r["state"], "engine": "std",
+                    "frac": round(r["frac"], 3), "speed": r["sp"],
+                    "note": "Merging / converting on the server…" if r["state"] == "process" else ""})
+    keep = {id(r) for r in (
+        [r for r in out if r["state"] in ("run", "process")]
+        + [r for r in out if r["state"] == "resolve"][:4]
+        + [r for r in out if r["state"] in ("done", "err")][-6:])}
+    return [r for r in out if id(r) in keep]  # big playlists: show what is happening, not 200 rows
+
+
 # ---------------- download worker ----------------
 def _make_progress_hook(job_id: str):
     def hook(d: dict) -> None:
@@ -635,6 +707,8 @@ def _make_progress_hook(job_id: str):
             frac = (int(j.get("completed_items") or 0) + j["current_pct"] / 100) / tot
             el = time.time() - (j.get("t0") or time.time())
             j["eta"] = int(el * (1 - frac) / frac) if frac > 0.03 and el > 3 else 0
+            if not d.get("_turbo"):
+                _frow_update(j, d, key, act)
         if fin:
             ai = d.get("info_dict") or {}
             if ai.get("abr") and ai.get("vcodec") in (None, "none"):
@@ -660,6 +734,10 @@ def _make_pp_hook(job_id: str):
                     j = JOBS.get(job_id)
                     if j:
                         j["completed_items"] = int(j.get("completed_items") or 0) + 1
+                        b = _row_base((d.get("info_dict") or {}).get("filepath") or "")
+                        fr = (j.get("_frows") or {}).get(b)
+                        if fr is not None:
+                            fr["state"], fr["frac"], fr["sp"] = "done", 1.0, 0.0
     return hook
 
 
@@ -812,6 +890,15 @@ class _TT:
         self.ready = False
         self.done = self.total = 0
         self.last_t, self.last_done, self.sp = time.time(), 0, 0.0
+        self.order, self.state, self.note = 0, "resolve", ""
+
+    def view(self) -> dict:
+        cells, act = _cells(self)
+        live = sum(it.live for it, _f in self.items)
+        return {"key": f"t{self.order}", "name": os.path.splitext(os.path.basename(self.final))[0],
+                "state": self.state, "engine": "turbo", "size": self.total, "bytes": max(0, self.done),
+                "speed": self.sp if self.state == "run" else 0, "live": live, "cells": cells, "act": act,
+                "note": self.note}
 
     def release(self, k: int, err=None) -> bool:
         """Count k finished/abandoned pieces of work; True exactly when everything is settled."""
@@ -883,7 +970,8 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
             if vu and not vu.startswith("http"):
                 vu = f"https://www.youtube.com/watch?v={vu}"
             if vu:
-                work.append((vu, str(out_dir / f"{str(i).zfill(w)} - %(title)s.%(ext)s")))
+                work.append((vu, str(out_dir / f"{str(i).zfill(w)} - %(title)s.%(ext)s"),
+                             e.get("title") or vu.split("//", 1)[-1][:60]))
     else:
         for t in targets:
             tm = default_tmpl
@@ -891,7 +979,7 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
                 q = re.sub(r"\s+audio$", "", t.split(":", 1)[1])
                 nm = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", q).strip(" .")[:150] or "track"
                 tm = str(out_dir / (nm + ".%(ext)s"))
-            work.append((t, tm))
+            work.append((t, tm, nm if t.startswith("ytsearch") else t.split("//", 1)[-1][:60]))
     if not work:
         return None
 
@@ -900,6 +988,11 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
     leftover: list = []
     lk = threading.Lock()
     cancelled = lambda: bool((JOBS.get(job_id) or {}).get("cancel"))  # noqa: E731
+    with JOBS_LOCK:
+        j0 = JOBS.get(job_id)
+        if j0 is not None:
+            j0["workers"], j0["engine"], j0["_tt"] = workers, "turbo", []
+            j0["_pend"] = {i: {"key": f"p{i}", "name": nm, "order": i} for i, (_t, _tm, nm) in enumerate(work)}
     _job_log(job_id, f"Turbo engine: {workers} parallel connections shared by {len(work)} item(s).", "ok")
 
     def on_bytes(it, n):
@@ -913,7 +1006,7 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
             T.sp = T.sp * 0.5 + sp * 0.5 if T.sp else sp
             T.last_t, T.last_done = now, T.done
             d = {"status": "downloading", "filename": T.final, "downloaded_bytes": T.done,
-                 "total_bytes": T.total, "speed": T.sp}
+                 "total_bytes": T.total, "speed": T.sp, "_turbo": True}
         try:
             hook(d)
         except DownloadCancelled:
@@ -985,8 +1078,13 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
             if media == "audio":
                 f0 = T.items[0][1]
                 ai = {"abr": f0.get("abr"), "acodec": f0.get("acodec"), "vcodec": f0.get("vcodec")}
-            hook({"status": "finished", "filename": T.final, "info_dict": ai})
+            hook({"status": "finished", "filename": T.final, "info_dict": ai, "_turbo": True})
+            T.sp = 0.0
+            T.note = ("Converting to MP3…" if media == "audio" and aq != "orig" else
+                      "Merging video + audio…" if len(T.items) == 2 else "Finalizing…")
+            T.state = "process"
             out = post(T)
+            T.state = "done"
             with JOBS_LOCK:
                 j = JOBS.get(job_id)
                 if j:
@@ -995,6 +1093,7 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
         except (turbodl.Cancelled, DownloadCancelled):
             cleanup(T)
         except Exception as ex:  # noqa: BLE001
+            T.state = "std"  # hidden: the standard downloader's row takes over
             cleanup(T)
             with JOBS_LOCK:
                 j = JOBS.get(job_id)
@@ -1015,11 +1114,19 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
     pool = turbodl.TurboPool(workers=workers, max_active=int(os.environ.get("TURBO_ACTIVE") or 3),
                              cancelled=cancelled, on_bytes=on_bytes, on_done=on_done)
 
-    def prep(entry):
-        t, tmpl = entry
+    def drop_pending(idx):
+        with JOBS_LOCK:
+            j = JOBS.get(job_id)
+            if j is not None:
+                (j.get("_pend") or {}).pop(idx, None)
+
+    def prep(arg):
+        idx, (t, tmpl, _nm) = arg
+        entry = (t, tmpl)
         if cancelled():
             return
         ck = _cookie_copy(cookies, job_id, "x" + uuid.uuid4().hex[:6])
+        T = None
         try:
             eo = {"format": opts["format"], "outtmpl": tmpl, "quiet": True, "no_warnings": True,
                   "noplaylist": True, "skip_download": True, "socket_timeout": 30, "retries": 5,
@@ -1057,6 +1164,12 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
                     heads.append(h)
             base = os.path.splitext(final)[0]
             T = _TT(t, tmpl, final)
+            T.order = idx
+            with JOBS_LOCK:  # placeholder row -> real row
+                j = JOBS.get(job_id)
+                if j is not None:
+                    j.setdefault("_tt", []).append(T)
+                    (j.get("_pend") or {}).pop(idx, None)
             for f, h in zip(fm, heads):
                 fid = re.sub(r"[^\w\-]", "_", str(f.get("format_id") or "x"))
                 it = turbodl.Item(f["url"], f"{base}.f{fid}.{f.get('ext') or 'bin'}.part", h,
@@ -1080,11 +1193,15 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
                 added += 1
                 T.total += it.size
             T.ready = True
+            T.state = "run"
             if T.release(1):
                 ex_post.submit(finish, T)
         except (DownloadCancelled, turbodl.Cancelled):
             return
         except Exception as ex:  # noqa: BLE001
+            if T is not None:
+                T.state = "std"
+            drop_pending(idx)
             _job_log(job_id, f"Standard downloader for {t[:60]}: {str(ex)[:90]}")
             with lk:
                 leftover.append(entry)
@@ -1095,7 +1212,7 @@ def _turbo_download(job_id: str, opts: dict, targets: list, mode: str, job: dict
     pool.start()
     try:
         with ThreadPoolExecutor(max_workers=max(1, min(4, len(work)))) as ex:
-            list(ex.map(prep, work))
+            list(ex.map(prep, enumerate(work)))
     finally:
         pool.close()
         pool.join()
@@ -1300,10 +1417,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 if out:
                     out["log"] = list(j.get("log") or [])
                     out["links"] = list(j.get("links") or [])
+                    out["items"] = _items_view(j)
+                    out["live"] = sum(int(r.get("live") or 0) for r in out["items"])
             if not out:
                 return self._send_json(404, {"error": "unknown job"})
-            out.pop("cookies_file", None)
-            out.pop("_act", None)
+            for k in ("cookies_file", "_act", "_tt", "_pend", "_frows"):
+                out.pop(k, None)
             self._send_json(200, out)
         elif path == "/api/files":
             self._send_json(200, {"files": _list_downloaded_files()})
@@ -1641,7 +1760,7 @@ function drawN(P,cx,cy,R,h,prog,al,f4,f5){
   g.lineWidth=lw;g.strokeStyle="hsla("+hh+",95%,"+(58+d*34)+"%,"+(A*(prog<0?.3+d*.9:.13))+")";g.beginPath();g.moveTo(x1,y1);g.lineTo(x2,y2);g.stroke();
   if(prog>=0&&lit>0){const xe=x1+(x2-x1)*lit,ye=y1+(y2-y1)*lit;if(Q===0){g.lineWidth=lw+5;g.strokeStyle="hsla("+hh+",100%,60%,"+A*.16+")";g.beginPath();g.moveTo(x1,y1);g.lineTo(xe,ye);g.stroke()}g.lineWidth=lw+.8;g.strokeStyle="hsla("+hh+",100%,"+(62+d*28)+"%,"+A+")";g.beginPath();g.moveTo(x1,y1);g.lineTo(xe,ye);g.stroke()}
   else if(prog<0&&Q===0&&d>.34){g.lineWidth=lw+4;g.strokeStyle="hsla("+hh+",100%,60%,"+A*.07+")";g.beginPath();g.moveTo(x1,y1);g.lineTo(x2,y2);g.stroke()}}
- if(Q<2)for(let n=0;n<NV;n++){const p=P[n],f=((n&8)?f4:1)*((n&16)?f5:1);if(f<.05)continue;g.fillStyle="hsla("+h+",100%,84%,"+al*f*.9+")";g.beginPath();g.arc(cx+p[0]*R,cy+p[1]*R,1.3+p[2]*3.6,0,6.283);g.fill()}}
+ if(Q<2)for(let n=0;n<NV;n++){const p=P[n],f=((n&8)?f4:1)*((n&16)?f5:1);if(f<.05)continue;g.fillStyle="hsla("+h+",100%,84%,"+al*f*.9+")";g.beginPath();g.arc(cx+p[0]*R,cy+p[1]*R,Math.max(.2,1.3+p[2]*3.6),0,6.283);g.fill()}}
 const K={hue:{idle:262,fetch:200,download:190,merge:320,convert:150,zip:40,done:140,error:350},sc:{idle:1,fetch:1.06,download:1,merge:.85,convert:1.04,zip:.62,done:1.12,error:.95},sp:{idle:1,fetch:4,download:2.4,merge:2,convert:3,zip:6,done:.8,error:.3},
  st:{paste:[.46,1,0],fetch:[.46,1.08,1],choose:[.25,.5,1],prog:[.47,1.1,1],done:[.4,.85,1]}};
 const A=new Array(10).fill(0);let hue=262,sc=1,sp=1,mx=0,my=0,tx=0,ty=0,cyk=.46,stk=1,f4=0,f5=0,T=0,last=0,ema=16,lastQ=0,parts=[],rings=[],lastPct=-1;
@@ -1704,12 +1823,12 @@ const vis=()=>$$("#cards .cd:not(.x)");
 $("#flt").oninput=e=>{const q=e.target.value.trim().toLowerCase();$$("#cards .cd").forEach(c=>c.classList.toggle("x",!!q&&!c.dataset.t.includes(q)));selTxt()};
 $("#selAll").onclick=()=>{vis().forEach(c=>c.classList.add("sel"));selTxt();tone(740,.2)};
 $("#selNone").onclick=()=>{vis().forEach(c=>c.classList.remove("sel"));selTxt();tone(420,.2)};
-function fail(msg,back){logOff();S.busy=false;try{localStorage.removeItem("ytdl_job")}catch(_){}$("#fErr").textContent=msg;toast(msg.slice(0,60));phase("error");go(back);setTimeout(()=>phase("idle"),50)}
+function fail(msg,back){window.TurboUI&&TurboUI.serverEnd();logOff();S.busy=false;try{localStorage.removeItem("ytdl_job")}catch(_){}$("#fErr").textContent=msg;toast(msg.slice(0,60));phase("error");go(back);setTimeout(()=>phase("idle"),50)}
 function phaseOf(j,cur){const s=j.stage||"";if(j.status==="done")return"done";if(j.status==="error")return"error";if(/Merg/i.test(s))return"merge";if(/Extract|Convert|Audio/i.test(s))return"convert";if(/ZIP/i.test(s))return"zip";if(j.status==="fetching")return"fetch";if(/^Downloading/i.test(s))return"download";return cur}
 async function poll(id,kind){const my=++tok;let fails=0;
  for(;;){await sleep(kind==="probe"?500:650);if(my!==tok)return;let j;
   try{j=await api("/api/job/"+id);fails=0}catch(e){if(++fails>=6||/unknown job/.test(e.message)){if(my===tok)fail(/unknown job/.test(e.message)?"Job lost — server restarted?":"Lost connection to the server",kind==="probe"?"paste":"choose");return}continue}
-  if(my!==tok)return;logs(j.log);logBg(j.log);S.speed=j.speed||0;
+  if(my!==tok)return;logs(j.log);logBg(j.log);S.speed=j.speed||0;if(kind!=="probe"&&window.TurboUI)TurboUI.server(j,{cancel:srvCancel,title:S.probe&&S.probe.title});
   if(j.status==="cancelled"){S.busy=false;try{localStorage.removeItem("ytdl_job")}catch(_){}logOff();toast("Download cancelled");S.target=0;phase("idle");cancelReset();go("choose");return}
   if(kind==="probe"){S.target=j.progress||0;$("#fS").textContent=j.stage||j.status;
    if(j.status==="probe_done"){logOff();S.probe=j.probe;S.target=0;phase("idle");showProbe(j.probe);return}
@@ -1730,7 +1849,7 @@ $("#goF").onclick=doFetch;$("#url").addEventListener("keydown",e=>{if(e.key==="E
 document.addEventListener("paste",e=>{const t=(e.clipboardData||window.clipboardData).getData("text");if(S.step==="paste"&&e.target.id!=="url"&&/https?:\/\//.test(t)){e.preventDefault();feed(t)}});
 document.addEventListener("dragover",e=>e.preventDefault());
 document.addEventListener("drop",e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f&&/\.txt$/i.test(f.name))return upCookie(f);if(S.step==="paste")feed(e.dataTransfer.getData("text/uri-list")||e.dataTransfer.getData("text/plain"))});
-function reset(){tok++;logOff();S.probe=null;S.busy=false;S.target=0;S.disp=0;$("#url").value="";$("#fErr").textContent="";phase("idle");document.title="3·4·5D downloader";go("paste")}
+function reset(){tok++;window.TurboUI&&TurboUI.serverEnd();logOff();S.probe=null;S.busy=false;S.target=0;S.disp=0;$("#url").value="";$("#fErr").textContent="";phase("idle");document.title="3·4·5D downloader";go("paste")}
 $("#back").onclick=reset;$("#again").onclick=reset;
 $("#goD").onclick=async()=>{if(!S.probe||S.busy)return;const p=S.probe,ix=selIdx();if(!ix.length){toast("pick at least one");return}
  let urls,pi="";if(p.mode==="playlist"){urls=[p.urls[0]];pi=rng(ix)}else urls=ix.map(i=>p.videos[i].url).filter(Boolean);
@@ -1768,6 +1887,7 @@ function cancelReset(){cArm=0;clearTimeout(cT);cb.disabled=false;cb.textContent=
 cb.onclick=async()=>{if(!cArm){cArm=1;cb.textContent="TAP AGAIN TO CANCEL";cb.classList.add("arm");cT=setTimeout(cancelReset,2600);return}
  clearTimeout(cT);cb.disabled=true;cb.textContent="CANCELLING…";try{await api("/api/cancel",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({job_id:S.job})})}catch(e){toast(e.message);cancelReset()}};
 $("#cancelF").onclick=()=>reset();
+const srvCancel=()=>api("/api/cancel",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({job_id:S.job})}).catch(e=>toast(e.message));
 /* resume a running download after a page refresh */
 (async()=>{try{const id=localStorage.getItem("ytdl_job");if(!id)return;const j=await api("/api/job/"+id);if(j.kind==="download"&&(j.status==="running"||j.status==="queued")){S.busy=true;S.target=1;S.job=id;$("#pT").textContent="Resuming…";go("prog");poll(id,"dl")}else localStorage.removeItem("ytdl_job")}catch(_){try{localStorage.removeItem("ytdl_job")}catch(__){}}})();
 $("#url").focus({preventScroll:true});
