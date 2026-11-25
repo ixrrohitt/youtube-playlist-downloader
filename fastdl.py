@@ -13,6 +13,7 @@ CLIENT side (TURBO_JS, injected into the page by html_tag()):
     between files, up to 4 files in flight, the rest queued; per-file retry (3x) and fallback
   * Streams straight to disk via File System Access API (Chrome/Edge desktop); "SAVE ALL" asks for a
     folder once and writes every file into it; other browsers assemble Blobs (1.5 GB memory budget)
+  * The SAME panel also shows the server's own download (TurboUI.server, fed by /api/job polling)
   * Animated, DRAGGABLE panel (position remembered, double-click header to reset): overall bar,
     speed graph, ETA, connections, and one row per file with step dots, piece map and cancel
 """
@@ -145,8 +146,9 @@ const fb=b=>b>=1073741824?(b/1073741824).toFixed(2)+" GB":b>=1048576?(b/1048576)
 const fsp=b=>b>=1048576?(b/1048576).toFixed(1)+" MB/s":(Math.max(0,b)/1024|0)+" KB/s";
 const ft=s=>!isFinite(s)||s<=0?"\u2014":s<60?Math.ceil(s)+"s":s<3600?(s/60|0)+"m "+(Math.ceil(s)%60)+"s":(s/3600|0)+"h "+((s/60|0)%60)+"m";
 const clean=n=>String(n||"").replace(/[\\\/:*?"<>|\x00-\x1f]+/g,"_").trim()||"download";
-const M={tasks:[],conn:0,mem:0,seq:0,hist:[],sp:0,lb:0,ls:0,pc:0,ticking:false,hideT:0,armT:0,armed:false,
+const M={srvCancel:null,srvCancelling:false,tasks:[],conn:0,mem:0,seq:0,hist:[],sp:0,lb:0,ls:0,pc:0,ticking:false,hideT:0,armT:0,armed:false,
  pk:Promise.resolve(),dk:Promise.resolve(),nat:Promise.resolve(),oldTitle:"",warn:false,lastMsg:"",lastClamp:0};
+const SRV={tasks:new Map(),info:null,id:"",title:"",ended:false};
 const bu=e=>{e.preventDefault();e.returnValue=""};
 
 /* ================= panel: styles + markup ================= */
@@ -217,6 +219,7 @@ const css=`
 .tb-all{display:block;margin:0 auto 14px;padding:12px 24px;border:0;border-radius:99px;cursor:pointer;color:#fff;font:800 12px ui-sans-serif,system-ui;letter-spacing:.14em;background:linear-gradient(135deg,#7c5cff,#ff3d9a);box-shadow:0 12px 30px -12px rgba(255,61,154,.8),5px 5px 14px rgba(0,0,0,.9),-3px -3px 10px rgba(255,255,255,.05)}
 .tb-all:active{filter:brightness(.88)}
 @media(prefers-reduced-motion:reduce){#tb-p *{animation:none!important}}
+body.tb-srv #bglog,body.tb-srv #s-prog .t2,body.tb-srv #s-prog .hint,body.tb-srv #cancel{display:none!important}
 `;
 const stl=document.createElement("style");stl.textContent=css;document.head.appendChild(stl);
 const P=document.createElement("div");P.id="tb-p";P.dataset.s="run";
@@ -278,10 +281,13 @@ function openPanel(){
   if(P.dataset.moved!=="1")restorePos();
   void P.offsetWidth;P.classList.add("on")}
  else P.dataset.s="run";
- if(!M.warn){M.warn=true;M.oldTitle=document.title;addEventListener("beforeunload",bu)}}
+}
+function setWarn(on){
+ if(on&&!M.warn){M.warn=true;M.oldTitle=document.title;addEventListener("beforeunload",bu)}
+ else if(!on&&M.warn){M.warn=false;removeEventListener("beforeunload",bu);document.title=M.oldTitle}}
 function closePanel(){
  clearTimeout(M.hideT);P.classList.remove("on");
- setTimeout(()=>{if(!M.tasks.some(t=>!t.fin)){M.tasks=[];L.innerHTML=""}},900)}
+ setTimeout(()=>{if(!M.tasks.some(t=>!t.fin)){M.tasks=[];SRV.tasks.clear();L.innerHTML=""}},900)}
 $("tb-mn").onclick=()=>P.classList.toggle("min");
 const xb=$("tb-x");
 function disarm(){M.armed=false;clearTimeout(M.armT);xb.classList.remove("arm");xb.textContent="\u2715"}
@@ -296,10 +302,17 @@ function mkRow(t){
  d.innerHTML=`<div class="r1"><span class="rn"></span><b class="rp">0%</b><button class="rx" title="cancel / remove">\u2715</button></div><div class="r2"></div><div class="r3"><span class="dts" title="check \u2192 destination \u2192 download \u2192 save"><i></i><i></i><i></i><i></i></span><canvas class="rc"></canvas></div>`;
  const e={root:d,rn:d.querySelector(".rn"),rp:d.querySelector(".rp"),r2:d.querySelector(".r2"),dots:[...d.querySelectorAll(".dts i")],cv:d.querySelector(".rc"),x:d.querySelector(".rx"),s:"",tx:"",pp:"",dk:-9};
  e.rn.textContent=t.name;e.rn.title=t.name;
- e.x.onclick=()=>{if(!t.fin)cancelTask(t,"Cancelled");else{d.remove();M.tasks=M.tasks.filter(z=>z!==t);if(!M.tasks.length)closePanel()}};
+ if(t.srv)d.querySelector(".dts").title="resolve \u2192 download \u2192 process \u2192 ready";
+ e.x.onclick=()=>{if(!t.fin)cancelTask(t,"Cancelled");else{d.remove();M.tasks=M.tasks.filter(z=>z!==t);if(t.srv)SRV.tasks.delete(t.key);if(!M.tasks.length)closePanel()}};
  L.appendChild(d);t.el=e;return e}
-function dotIdx(t){return t.state==="probe"||t.state==="queued"?-1:t.state==="dest"?1:t.state==="run"?2:t.state==="save"?3:t.state==="done"?4:-1}
+function dotIdx(t){if(t.srv)return t.state==="resolve"?0:t.state==="run"?2:t.state==="process"?3:t.state==="done"?4:-1;return t.state==="probe"||t.state==="queued"?-1:t.state==="dest"?1:t.state==="run"?2:t.state==="save"?3:t.state==="done"?4:-1}
 function rowText(t,now){
+ if(t.srv)switch(t.state){
+  case "resolve":return "Resolving direct links on the server\u2026";
+  case "run":return t.engine==="std"?Math.round((t.size?t.bytes/t.size:t.frac)*100)+"% \u00b7 "+fsp(t.sp)+" \u00b7 standard downloader":fb(t.bytes)+" / "+fb(t.size)+" \u00b7 "+fsp(t.sp)+" \u00b7 "+t.live+" conn \u00b7 server turbo";
+  case "process":return t.note||"Merging / converting on the server\u2026";
+  case "done":return "Ready on the server"+(t.size?" \u00b7 "+fb(t.size):"");
+  default:return t.note||(t.state==="err"?"Failed on the server":"Cancelled")}
  switch(t.state){
   case "queued":return t.wait?"Queued \u00b7 waiting for memory":"Queued \u00b7 "+fb(t.size)+" \u00b7 waiting for a free slot";
   case "dest":return t.dir?"Creating the file in your folder\u2026":(window.showSaveFilePicker?"Choose where to save\u2026":"Getting ready\u2026");
@@ -326,47 +339,57 @@ function renderRow(t,now){
  if(e.s!==t.state){e.s=t.state;e.root.dataset.s=t.state}
  const k=dotIdx(t);if(e.dk!==k){e.dk=k;e.dots.forEach((d,i)=>{d.className=i<k?"ok":i===k?"cur":""})}
  const tx=rowText(t,now);if(tx!==e.tx){e.tx=tx;e.r2.textContent=tx}
- t.pc+=((t.size?t.bytes/t.size*100:0)-t.pc)*.25;
+ t.pc+=((t.size?t.bytes/t.size*100:(t.frac||0)*100)-t.pc)*.25;
  const p=t.state==="done"?100:Math.floor(Math.min(99.9,t.pc)),ps=p+"%";if(ps!==e.pp){e.pp=ps;e.rp.textContent=ps}
- if(t.state!=="cancel")drawMap(t,now)}
+ if(t.state!=="cancel")(t.srv?drawSrvMap:drawMap)(t,now)}
 
 /* ================= overall tick ================= */
 function tick(now){
- const T=M.tasks;let tot=0,all=0,left=0,nr=0,nq=0,nd=0,ne=0;
+ const T=M.tasks;let lt=0,la=0,left=0,nr=0,nq=0,nd=0,sB=0,sS=0,hasS=false,hasL=false,localLive=false;
  for(const t of T){
   if(t.state==="cancel")continue;
-  all+=t.size;tot+=t.state==="done"?t.size:t.bytes;
-  if(!t.fin)left+=t.size-t.bytes;
-  if(t.state==="dest"||t.state==="run"||t.state==="save")nr++;else if(t.state==="queued")nq++;else if(t.state==="done")nd++;else if(t.state==="err")ne++}
+  if(t.srv){hasS=true;if(t.size){sS+=t.size;sB+=t.state==="done"?t.size:t.bytes}}
+  else{hasL=true;la+=t.size;lt+=t.state==="done"?t.size:t.bytes;if(!t.fin){left+=t.size-t.bytes;localLive=true}}
+  if(t.state==="dest"||t.state==="run"||t.state==="save"||t.state==="process")nr++;
+  else if(t.state==="queued"||t.state==="resolve")nq++;else if(t.state==="done")nd++}
+ const S0=SRV.info,sOn=!!S0&&!SRV.ended,sSpd=sOn?S0.speed:0;
  if(now-M.ls>=250){
-  const dt=(now-M.ls)/1000,inst=Math.max(0,(tot-M.lb)/dt);
-  M.sp=M.sp?M.sp*.7+inst*.3:inst;M.lb=tot;M.ls=now;M.hist.push(M.sp);if(M.hist.length>80)M.hist.shift();
-  for(const t of T)if(!t.fin){const ti=Math.max(0,(t.bytes-t.lb)/dt);t.sp=t.sp?t.sp*.7+ti*.3:ti;t.lb=t.bytes}
+  const dt=(now-M.ls)/1000,inst=Math.max(0,(lt-M.lb)/dt);
+  M.sp=M.sp?M.sp*.7+inst*.3:inst;M.lb=lt;M.ls=now;
+  M.hist.push(M.sp+sSpd);if(M.hist.length>80)M.hist.shift();
+  for(const t of T)if(!t.fin&&!t.srv){const ti=Math.max(0,(t.bytes-t.lb)/dt);t.sp=t.sp?t.sp*.7+ti*.3:ti;t.lb=t.bytes}
   drawSpark(M.hist);
-  $("tb-sv").textContent=fsp(M.sp);
-  $("tb-et").textContent=M.sp>1024&&left>0?ft(left/M.sp):"\u2014";
-  $("tb-dn").textContent=fb(tot);$("tb-dnl").textContent="of "+fb(all)}
+  $("tb-sv").textContent=fsp(M.sp+sSpd);
+  const e=Math.max(M.sp>1024&&left>0?left/M.sp:0,sOn?S0.eta:0);
+  $("tb-et").textContent=e>0?ft(e):"\u2014";
+  $("tb-dn").textContent=fb(lt+sB);$("tb-dnl").textContent=(la+sS)?"of "+fb(la+sS):"received"}
  const live=T.some(t=>!t.fin);
- const target=all?tot/all*100:0;M.pc+=(target-M.pc)*.2;
+ const sw=S0?Math.max(sS,5e7):0,pa=la+sw,pt=lt+(S0?sw*S0.pct/100:0);
+ M.pc+=((pa?pt/pa*100:0)-M.pc)*.2;
  const p=live?Math.min(M.pc,99.9):(nd?100:Math.min(M.pc,100));
  $("tb-f").style.width=p.toFixed(2)+"%";$("tb-pc").textContent=Math.floor(p);
- $("tb-cn").textContent=M.conn+"/"+PAR;
+ const cap=(localLive?PAR:0)+(sOn?(S0.workers||0):0),cn=M.conn+(sOn?(S0.live||0):0);
+ $("tb-cn").textContent=cap?cn+"/"+cap:(cn?String(cn):"\u2014");
+ const ttl=hasS&&!hasL?"Server download":hasL&&!hasS?"Save to your device":"Turbo downloads";
+ if($("tb-n").textContent!==ttl)$("tb-n").textContent=ttl;
+ setWarn(localLive);
  if(live){
-  document.title=Math.floor(p)+"% \u00b7 saving";
-  const parts=[];if(nr)parts.push(nr+" downloading");if(nq)parts.push(nq+" queued");if(nd)parts.push(nd+" done");
+  if(localLive)document.title=Math.floor(p)+"% \u00b7 saving";
+  const so=hasS&&!hasL,parts=[];
+  if(nr)parts.push(nr+(so?" active":" downloading"));if(nq)parts.push(nq+(so?" waiting":" queued"));if(nd)parts.push(nd+" done");
   if(!M.armed)msg((T.length>1?T.length+" files \u00b7 ":"")+parts.join(" \u00b7 "))}
  for(const t of T)renderRow(t,now);
  if(now-M.lastClamp>400){M.lastClamp=now;clampPos()}
- if(live)requestAnimationFrame(tick);else M.ticking=false}
-function ensureTick(){if(M.ticking)return;M.ticking=true;M.ls=performance.now();M.lb=0;for(const t of M.tasks)M.lb+=t.state==="done"?t.size:t.bytes;requestAnimationFrame(tick)}
+ if(live)requestAnimationFrame(tick);else{M.ticking=false;$("tb-sv").textContent="\u2014"}}
+function ensureTick(){if(M.ticking)return;M.ticking=true;M.ls=performance.now();M.lb=0;for(const t of M.tasks)if(!t.srv)M.lb+=t.state==="done"?t.size:t.bytes;requestAnimationFrame(tick)}
 function checkIdle(){
  if(M.tasks.some(t=>!t.fin))return;
- if(M.warn){M.warn=false;removeEventListener("beforeunload",bu);document.title=M.oldTitle}
+ setWarn(false);
  disarm();
  const nd=M.tasks.filter(t=>t.state==="done").length,ne=M.tasks.filter(t=>t.state==="err").length;
  P.dataset.s=ne?"err":nd?"done":"cancel";
  const total=M.tasks.filter(t=>t.state==="done").reduce((a,t)=>a+t.size,0);
- msg(nd?(nd>1?nd+" files saved":"Saved")+" \u00b7 "+fb(total)+(ne?" \u00b7 "+ne+" via normal download":""):ne?"Switched to normal download":"Nothing saved");
+ msg(M.tasks.every(t=>t.srv)?(nd?"Server finished \u00b7 "+nd+(nd>1?" files":" file")+" ready to save":ne?"Server download failed":"Server download stopped"):nd?(nd>1?nd+" files saved":"Saved")+" \u00b7 "+fb(total)+(ne?" \u00b7 "+ne+" via normal download":""):ne?"Switched to normal download":"Nothing saved");
  requestAnimationFrame(now=>{ if(!M.ticking)tick(now) });
  clearTimeout(M.hideT);M.hideT=setTimeout(closePanel,7000)}
 
@@ -391,7 +414,12 @@ function endTask(t,state,text){
  if(t.fin)return;
  t.fin=true;t.state=state;if(text)t.note=text;t.ctl.abort();killWriter(t,true);releaseMem(t);
  activate();checkIdle();pump()}
-function cancelTask(t,text){t.cancelled=true;endTask(t,"cancel",text)}
+function cancelTask(t,text){
+ if(t.srv){
+  if(t.fin)return;
+  if(M.srvCancel&&!M.srvCancelling){M.srvCancelling=true;try{M.srvCancel()}catch(_){}}
+  t.note="Cancelling\u2026";return}
+ t.cancelled=true;endTask(t,"cancel",text)}
 function failTask(t,text){if(t.fin)return;t.failed=true;endTask(t,"err",text||"Problem \u00b7 switching to normal download");nat(t.url,t.name)}
 async function uniq(dir,name){
  const m=/^(.*?)(\.[^.]*)?$/.exec(name),b=m[1],x=m[2]||"";
@@ -422,7 +450,7 @@ async function begin(t){
   t.parts=new Array(t.n)}
  t.state="run";t.t0=performance.now();pump()}
 function activate(){
- let act=M.tasks.filter(t=>t.state==="dest"||t.state==="run"||t.state==="save").length;
+ let act=M.tasks.filter(t=>!t.srv&&(t.state==="dest"||t.state==="run"||t.state==="save")).length;
  for(const t of M.tasks){
   if(act>=MAXACT)break;
   if(t.state!=="queued")continue;
@@ -436,7 +464,7 @@ function pump(){
  while(M.conn<PAR){
   let best=null;
   for(const t of M.tasks){
-   if(t.state!=="run"||t.fin||t.next>=t.n||t.wq>=MAXWQ)continue;
+   if(t.srv||t.state!=="run"||t.fin||t.next>=t.n||t.wq>=MAXWQ)continue;
    if(!best||t.live<best.live)best=t}
   if(!best)break;
   runChunk(best,best.next++)}}
@@ -521,6 +549,69 @@ function syncAll(host){
 for(const id of["lib","links"]){
  const h=$(id);if(!h)continue;
  new MutationObserver(()=>syncAll(h)).observe(h,{childList:true});syncAll(h)}
+
+/* ================= server-side download shown in the same panel (rows fed by /api/job polling) ================= */
+function drawSrvMap(t,now){
+ const cv=t.el.cv,w=cv.clientWidth,h=10;if(!w)return;
+ const dpr=Math.min(devicePixelRatio||1,2),cw=Math.round(w*dpr);
+ if(cv.width!==cw){cv.width=cw;cv.height=Math.round(h*dpr)}
+ const g=cv.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);
+ const done=t.state==="done",hasC=t.cells&&t.cells.length;
+ if(t.state==="resolve"||(t.state==="process"&&!hasC)){
+  g.fillStyle="rgba(255,255,255,.07)";g.fillRect(0,0,w,h);
+  const bw=Math.max(40,w*.22),x=((now/6)%(w+bw))-bw,c=t.state==="process"?"43,255,154":"0,229,255",gr=g.createLinearGradient(x,0,x+bw,0);
+  gr.addColorStop(0,"rgba("+c+",0)");gr.addColorStop(.5,"rgba("+c+",.85)");gr.addColorStop(1,"rgba("+c+",0)");
+  g.fillStyle=gr;g.fillRect(0,0,w,h);return}
+ if(hasC){
+  const cn=t.cells.length,gap=cn>60?1:2,cwid=Math.max(1,(w-gap*(cn-1))/cn),pulse=.5+.5*Math.sin(now/120);
+  if(!t.cs||t.cs.length!==cn)t.cs=new Float64Array(cn);
+  for(let c=0;c<cn;c++){
+   t.cs[c]+=((done?100:t.cells[c])-t.cs[c])*.3;
+   const f=t.cs[c]/100,x=c*(cwid+gap);
+   g.fillStyle="rgba(255,255,255,.07)";g.fillRect(x,0,cwid,h);
+   if(f>0){g.fillStyle=done?"#16c784":"hsl("+(258-(c/cn)*70)+",95%,62%)";g.fillRect(x,0,cwid*f,h)}
+   if(!done&&t.act&&t.act.has(c)){g.strokeStyle="rgba(0,229,255,"+(.35+.5*pulse)+")";g.lineWidth=1;g.strokeRect(x+.5,.5,Math.max(1,cwid-1),h-1)}}
+  return}
+ const f=done?1:Math.min(1,t.size?t.bytes/t.size:t.frac);
+ t.c1=(t.c1||0)+(f-(t.c1||0))*.25;
+ const gr=g.createLinearGradient(0,0,w,0);gr.addColorStop(0,"#7c5cff");gr.addColorStop(1,"#00e5ff");
+ g.fillStyle="rgba(255,255,255,.07)";g.fillRect(0,0,w,h);g.fillStyle=done?"#16c784":gr;g.fillRect(0,0,w*t.c1,h)}
+function srvRemove(t){if(t.el)t.el.root.remove();SRV.tasks.delete(t.key);M.tasks=M.tasks.filter(z=>z!==t)}
+function serverSync(j,o){
+ o=o||{};
+ if(SRV.id!==j.id){for(const t of [...SRV.tasks.values()])srvRemove(t);SRV.id=j.id;SRV.ended=false;M.srvCancelling=false}
+ if(o.cancel)M.srvCancel=o.cancel;
+ if(o.title)SRV.title=o.title;
+ const term=j.status==="done"||j.status==="error"||j.status==="cancelled";
+ const tt=Math.max(1,j.total_items||1),dd=j.completed_items||0;
+ SRV.info={pct:j.status==="done"?100:Math.min(99,(dd+(j.current_pct||0)/100)/tt*100),speed:term?0:(j.speed||0),eta:term?0:(j.eta||0),live:term?0:(j.live||0),workers:j.workers||0};
+ SRV.ended=term;
+ let items=(j.items||[]).slice();
+ if(!items.length&&!term)items=[{key:"_prep",name:SRV.title||"Preparing download",state:"resolve",engine:"turbo"}];
+ const seen=new Set();
+ for(const it of items){
+  seen.add(it.key);
+  let t=SRV.tasks.get(it.key);
+  if(!t){
+   t={id:++M.seq,srv:true,key:it.key,name:it.name||"item",state:"resolve",fin:false,size:0,bytes:0,frac:0,sp:0,live:0,pc:0,note:"",engine:"turbo",cells:null,cs:null,act:null,el:null,lb:0};
+   SRV.tasks.set(it.key,t);M.tasks.push(t);mkRow(t)}
+  if(it.name&&t.name!==it.name){t.name=it.name;t.el.rn.textContent=it.name;t.el.rn.title=it.name}
+  t.state=it.state==="done"||it.state==="err"||it.state==="process"||it.state==="run"?it.state:"resolve";
+  t.engine=it.engine||"turbo";t.size=it.size||0;t.bytes=it.bytes||0;t.frac=it.frac||0;t.sp=it.speed||0;t.live=it.live||0;t.note=it.note||"";
+  t.cells=it.cells||null;t.act=it.act?new Set(it.act):null;
+  t.fin=t.state==="done"||t.state==="err"}
+ for(const t of [...SRV.tasks.values()])if(!seen.has(t.key))srvRemove(t);
+ if(term){
+  const st=j.status==="done"?"done":j.status==="error"?"err":"cancel";
+  for(const t of SRV.tasks.values())if(!t.fin){t.state=st;t.fin=true;if(st==="err")t.note=String(j.error||"Failed").slice(0,90)}}
+ document.body.classList.toggle("tb-srv",!term);
+ if(M.tasks.length){openPanel();ensureTick()}
+ if(term){M.srvCancel=null;checkIdle()}}
+function serverEnd(){
+ document.body.classList.remove("tb-srv");M.srvCancel=null;SRV.ended=true;
+ for(const t of SRV.tasks.values())if(!t.fin){t.state="cancel";t.fin=true}
+ if(P.classList.contains("on")&&M.tasks.length)checkIdle()}
+window.TurboUI={server:serverSync,serverEnd};
 window.TurboDL={add:(u,n,o)=>add(u,n,o),cancelAll:()=>M.tasks.forEach(t=>!t.fin&&cancelTask(t,"Cancelled")),pool:PAR};
 })();
 """
