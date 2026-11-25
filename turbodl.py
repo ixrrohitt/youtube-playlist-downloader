@@ -60,6 +60,8 @@ class Item:
         self.error: Exception | None = None
         self.settled = False
         self.fd: int | None = None
+        self.pst = bytearray()   # per piece: 0 waiting, 1 downloading, 2 done (for live progress maps)
+        self.pgot: list = []     # per piece: bytes received so far
         self._wlock = threading.Lock()
 
     def write(self, off: int, buf: bytes) -> None:
@@ -188,6 +190,8 @@ class TurboPool:
         piece = max(lo, min(cap, -(-piece // 1048576) * 1048576))
         item.size, item.piece = total, piece
         item.n = -(-total // piece)
+        item.pst = bytearray(item.n)
+        item.pgot = [0] * item.n
         item.fd = os.open(item.dest, os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o644)
         try:
             os.ftruncate(item.fd, total)
@@ -316,6 +320,7 @@ class TurboPool:
             if self.cancelled() or it.error is not None:
                 raise Cancelled()
             got, r, ok = 0, None, False
+            it.pst[idx], it.pgot[idx] = 1, 0
             try:
                 r = conns.get(it, start, end)
                 if r.status in _EXPIRED:
@@ -330,11 +335,13 @@ class TurboPool:
                     it.write(off, buf)
                     off += len(buf)
                     got += len(buf)
+                    it.pgot[idx] = got
                     self._count(it, len(buf))
                     if self.cancelled() or it.error is not None:
                         raise Cancelled()
                 if r.will_close:
                     conns.drop(r._tb_key)
+                it.pst[idx] = 2
                 ok = True
                 return
             except (Cancelled, Expired):
@@ -345,6 +352,7 @@ class TurboPool:
                 time.sleep(min(0.5 * 2 ** attempt, 5))
             finally:
                 if not ok:
+                    it.pst[idx], it.pgot[idx] = 0, 0
                     if r is not None:
                         conns.drop(r._tb_key)
                     if got:
